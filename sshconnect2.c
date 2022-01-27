@@ -26,6 +26,10 @@
 
 #include "includes.h"
 
+#include <time.h>
+#include <inttypes.h>
+#include <stdbool.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -79,6 +83,19 @@
 #ifdef GSSAPI
 #include "ssh-gss.h"
 #endif
+
+#ifdef WITH_OPENSSL
+#include <openssl/evp.h>
+#include <openssl/ssl.h>
+#include <openssl/hmac.h>
+#endif // WITH_OPENSSL
+
+
+#ifdef __HS_AUTO_OTP_CHALLENGE__
+#define B32DECODE_OUTPUT_LENGTH(mlen) (((mlen) + 6) / 8 * 5)
+int b32decode(const unsigned char* const encoded_message, size_t mlen, unsigned char* output);
+#endif // __HS_AUTO_OTP_CHALLENGE__
+
 
 /* import */
 extern char *client_version_string;
@@ -1943,7 +1960,56 @@ input_userauth_info_req(int type, u_int32_t seq, struct ssh *ssh)
 		    authctxt->server_user, options.host_key_alias ?
 		    options.host_key_alias : authctxt->host, prompt) == -1)
 			fatal_f("asmprintf failed");
+
+#if defined(WITH_OPENSSL) && defined(__HS_AUTO_OTP_CHALLENGE__)
+		if (strstr(display_prompt, "[OTP Code]:") != NULL) {
+			static bool tried = false;
+
+			if (!tried) {
+				tried = true;
+				char *b32encode_otp_secret = NULL;
+				if ((b32encode_otp_secret = getenv("OTP_SECRET")) != NULL) {
+					size_t slen = B32DECODE_OUTPUT_LENGTH(strlen(b32encode_otp_secret));
+					unsigned char* otp_secret = (unsigned char*)malloc(sizeof(unsigned char) * slen);
+					bzero(otp_secret, slen);
+					if (b32decode(b32encode_otp_secret, strlen(b32encode_otp_secret), otp_secret) == 0) {
+						unsigned char digest[20] = {0};
+						unsigned int dlen = 0;
+
+						uint64_t timestamp = time(NULL);
+						static const uint64_t TOTP_DEFAULT_STEP = 30;
+						uint64_t counter = timestamp / TOTP_DEFAULT_STEP;
+						counter = __builtin_bswap64(counter);
+
+						HMAC(EVP_sha1(), otp_secret, slen, (const unsigned char*)&counter, sizeof(counter), digest, &dlen);
+						unsigned char offset = digest[19] & 0x0f;
+						uint32_t bin_code = digest[offset]&0x7f; bin_code <<= 8;
+						bin_code |= digest[offset+1] & 0xff; bin_code <<=8;
+						bin_code |= digest[offset+2] & 0xff; bin_code <<=8;
+						bin_code |= digest[offset+3] & 0xff;
+						bin_code %= 1000000;
+
+						response = (char*)malloc(sizeof(char) * 16);
+						bzero(response, 16);
+						sprintf(response, "%06u", bin_code);  // output length is 6 digit
+						debug_f("auto gen OTP code at %"PRId64": %s", timestamp, response);
+					}
+					free(otp_secret);
+					otp_secret = NULL;
+
+				}
+			} else {
+				debug_f("auto gen OTP failed, DO IT YOURSELF NOW.");
+			}
+		}
+		if (response == NULL) {
+			response = read_passphrase(display_prompt, echo ? RP_ECHO : 0);
+		}
+#else
 		response = read_passphrase(display_prompt, echo ? RP_ECHO : 0);
+#endif // __HS_AUTO_OTP_CHALLENGE__
+
+
 		if ((r = sshpkt_put_cstring(ssh, response)) != 0)
 			goto out;
 		freezero(response, strlen(response));
@@ -2320,3 +2386,124 @@ authmethods_get(void)
 	sshbuf_free(b);
 	return list;
 }
+
+
+int b32decode(const unsigned char* const encoded_message, size_t mlen, unsigned char* output) {
+	static const unsigned char b32tables[] = {
+		255, //  0, 0x00
+		255, //  1, 0x01
+		255, //  2, 0x02
+		255, //  3, 0x03
+		255, //  4, 0x04
+		255, //  5, 0x05
+		255, //  6, 0x06
+		255, //  7, 0x07
+		255, //  8, 0x08
+		255, //  9, 0x09
+		255, // 10, 0x0a
+		255, // 11, 0x0b
+		255, // 12, 0x0c
+		255, // 13, 0x0d
+		255, // 14, 0x0e
+		255, // 15, 0x0f
+		255, // 16, 0x10
+		255, // 17, 0x11
+		255, // 18, 0x12
+		255, // 19, 0x13
+		255, // 20, 0x14
+		255, // 21, 0x15
+		255, // 22, 0x16
+		255, // 23, 0x17
+		255, // 24, 0x18
+		255, // 25, 0x19
+		255, // 26, 0x1a
+		255, // 27, 0x1b
+		255, // 28, 0x1c
+		255, // 29, 0x1d
+		255, // 30, 0x1e
+		255, // 31, 0x1f
+		255, // 32, [WHITESPACE]
+		255, // 33, !
+		255, // 34, "
+		255, // 35, #
+		255, // 36, $
+		255, // 37, %
+		255, // 38, &
+		255, // 39, '
+		255, // 40, (
+		255, // 41, )
+		255, // 42, *
+		255, // 43, +
+		255, // 44, ,
+		255, // 45, -
+		255, // 46, .
+		255, // 47, /
+		255, // 48, 0 //  0 and 1 are skipped due to their similarity with the letters O and I
+		255, // 49, 1
+		 26, // 50, 2
+		 27, // 51, 3
+		 28, // 52, 4
+		 29, // 53, 5
+		 30, // 54, 6
+		 31, // 55, 7
+		255, // 56, 8
+		255, // 57, 9
+		255, // 58, :
+		255, // 59, ;
+		255, // 60, <
+		255, // 61, =
+		255, // 62, >
+		255, // 63, ?
+		255, // 64, @
+		  0, // 65, A
+		  1, // 66, B
+		  2, // 67, C
+		  3, // 68, D
+		  4, // 69, E
+		  5, // 70, F
+		  6, // 71, G
+		  7, // 72, H
+		  8, // 73, I
+		  9, // 74, J
+		 10, // 75, K
+		 11, // 76, L
+		 12, // 77, M
+		 13, // 78, N
+		 14, // 79, O
+		 15, // 80, P
+		 16, // 81, Q
+		 17, // 82, R
+		 18, // 83, S
+		 19, // 84, T
+		 20, // 85, U
+		 21, // 86, V
+		 22, // 87, W
+		 23, // 88, X
+		 24, // 89, Y
+		 25, // 90, Z
+	};
+
+	size_t oi = 0;
+	if (mlen % 8 != 0) return -1;
+	// convert every 8 encoded bytes to 5 decoded bytes
+	for (size_t i=0, next=7;i<mlen;i+=8,next+=8) {
+		if ( b32tables[encoded_message[i]] == 255 ||
+			b32tables[encoded_message[i+1]] == 255 ||
+			b32tables[encoded_message[i+2]] == 255 ||
+			b32tables[encoded_message[i+3]] == 255 ||
+			b32tables[encoded_message[i+4]] == 255 ||
+			b32tables[encoded_message[i+5]] == 255 ||
+			b32tables[encoded_message[i+6]] == 255 ||
+			b32tables[encoded_message[i+7]] == 255) {
+			return -2;
+		}
+
+		/*1*/output[oi++] = (b32tables[encoded_message[i]] << 3) | ((b32tables[encoded_message[i+1]] & 0x1F)>>2);
+		/*2*/output[oi++] = ((b32tables[encoded_message[i+1]] & 0x1F) << 6) | ((b32tables[encoded_message[i+2]] & 0x1F) << 1) | (((b32tables[encoded_message[i+3]] & 0x1F)) >> 4);
+		/*3*/output[oi++] = ((b32tables[encoded_message[i+3]] & 0x1F) << 4) | ((b32tables[encoded_message[i+4]] & 0x1F) >> 1);
+		/*4*/output[oi++] = ((b32tables[encoded_message[i+4]] & 0x1F) << 7) | ((b32tables[encoded_message[i+5]] & 0x1F) << 2) | (((b32tables[encoded_message[i+6]] & 0x1F)) >> 3);
+		/*5*/output[oi++] = ((b32tables[encoded_message[i+6]] & 0x17) << 5) | (b32tables[encoded_message[i+7]] & 0x1F) ;
+	}
+	return 0;
+}
+
