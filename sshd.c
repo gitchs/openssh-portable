@@ -1,4 +1,4 @@
-/* $OpenBSD: sshd.c,v 1.572 2021/04/03 06:18:41 djm Exp $ */
+/* $OpenBSD: sshd.c,v 1.590 2022/07/01 05:08:23 dtucker Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1995 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -64,6 +64,9 @@
 #include <paths.h>
 #endif
 #include <grp.h>
+#ifdef HAVE_POLL_H
+#include <poll.h>
+#endif
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -272,7 +275,7 @@ close_listen_socks(void)
 
 	for (i = 0; i < num_listen_socks; i++)
 		close(listen_socks[i]);
-	num_listen_socks = -1;
+	num_listen_socks = 0;
 }
 
 static void
@@ -354,19 +357,15 @@ main_sigchld_handler(int sig)
 static void
 grace_alarm_handler(int sig)
 {
-	if (use_privsep && pmonitor != NULL && pmonitor->m_pid > 0)
-		kill(pmonitor->m_pid, SIGALRM);
-
 	/*
 	 * Try to kill any processes that we have spawned, E.g. authorized
-	 * keys command helpers.
+	 * keys command helpers or privsep children.
 	 */
 	if (getpgid(0) == getpid()) {
 		ssh_signal(SIGTERM, SIG_IGN);
 		kill(0, SIGTERM);
 	}
 
-	/* XXX pre-format ipaddr/port so we don't need to access active_state */
 	/* Log error and exit. */
 	sigdie("Timeout before authentication for %s port %d",
 	    ssh_remote_ipaddr(the_active_state),
@@ -1129,33 +1128,54 @@ server_listen(void)
 static void
 server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 {
-	fd_set *fdset;
-	int i, j, ret, maxfd;
+	struct pollfd *pfd = NULL;
+	int i, j, ret, npfd;
 	int ostartups = -1, startups = 0, listening = 0, lameduck = 0;
-	int startup_p[2] = { -1 , -1 };
+	int startup_p[2] = { -1 , -1 }, *startup_pollfd;
 	char c = 0;
 	struct sockaddr_storage from;
 	socklen_t fromlen;
 	pid_t pid;
 	u_char rnd[256];
+	sigset_t nsigset, osigset;
 
-	/* setup fd set for accept */
-	fdset = NULL;
-	maxfd = 0;
-	for (i = 0; i < num_listen_socks; i++)
-		if (listen_socks[i] > maxfd)
-			maxfd = listen_socks[i];
 	/* pipes connected to unauthenticated child sshd processes */
 	startup_pipes = xcalloc(options.max_startups, sizeof(int));
 	startup_flags = xcalloc(options.max_startups, sizeof(int));
+	startup_pollfd = xcalloc(options.max_startups, sizeof(int));
 	for (i = 0; i < options.max_startups; i++)
 		startup_pipes[i] = -1;
+
+	/*
+	 * Prepare signal mask that we use to block signals that might set
+	 * received_sigterm or received_sighup, so that we are guaranteed
+	 * to immediately wake up the ppoll if a signal is received after
+	 * the flag is checked.
+	 */
+	sigemptyset(&nsigset);
+	sigaddset(&nsigset, SIGHUP);
+	sigaddset(&nsigset, SIGCHLD);
+	sigaddset(&nsigset, SIGTERM);
+	sigaddset(&nsigset, SIGQUIT);
+
+	/* sized for worst-case */
+	pfd = xcalloc(num_listen_socks + options.max_startups,
+	    sizeof(struct pollfd));
 
 	/*
 	 * Stay listening for connections until the system crashes or
 	 * the daemon is killed with a signal.
 	 */
 	for (;;) {
+		sigprocmask(SIG_BLOCK, &nsigset, &osigset);
+		if (received_sigterm) {
+			logit("Received signal %d; terminating.",
+			    (int) received_sigterm);
+			close_listen_socks();
+			if (options.pid_file != NULL)
+				unlink(options.pid_file);
+			exit(received_sigterm == SIGTERM ? 0 : 255);
+		}
 		if (ostartups != startups) {
 			setproctitle("%s [listener] %d of %d-%d startups",
 			    listener_proctitle, startups,
@@ -1168,37 +1188,41 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 				close_listen_socks();
 				lameduck = 1;
 			}
-			if (listening <= 0)
+			if (listening <= 0) {
+				sigprocmask(SIG_SETMASK, &osigset, NULL);
 				sighup_restart();
+			}
 		}
-		free(fdset);
-		fdset = xcalloc(howmany(maxfd + 1, NFDBITS),
-		    sizeof(fd_mask));
 
-		for (i = 0; i < num_listen_socks; i++)
-			FD_SET(listen_socks[i], fdset);
-		for (i = 0; i < options.max_startups; i++)
-			if (startup_pipes[i] != -1)
-				FD_SET(startup_pipes[i], fdset);
-
-		/* Wait in select until there is a connection. */
-		ret = select(maxfd+1, fdset, NULL, NULL, NULL);
-		if (ret == -1 && errno != EINTR)
-			error("select: %.100s", strerror(errno));
-		if (received_sigterm) {
-			logit("Received signal %d; terminating.",
-			    (int) received_sigterm);
-			close_listen_socks();
-			if (options.pid_file != NULL)
-				unlink(options.pid_file);
-			exit(received_sigterm == SIGTERM ? 0 : 255);
+		for (i = 0; i < num_listen_socks; i++) {
+			pfd[i].fd = listen_socks[i];
+			pfd[i].events = POLLIN;
 		}
+		npfd = num_listen_socks;
+		for (i = 0; i < options.max_startups; i++) {
+			startup_pollfd[i] = -1;
+			if (startup_pipes[i] != -1) {
+				pfd[npfd].fd = startup_pipes[i];
+				pfd[npfd].events = POLLIN;
+				startup_pollfd[i] = npfd++;
+			}
+		}
+
+		/* Wait until a connection arrives or a child exits. */
+		ret = ppoll(pfd, npfd, NULL, &osigset);
+		if (ret == -1 && errno != EINTR) {
+			error("ppoll: %.100s", strerror(errno));
+			if (errno == EINVAL)
+				cleanup_exit(1); /* can't recover */
+		}
+		sigprocmask(SIG_SETMASK, &osigset, NULL);
 		if (ret == -1)
 			continue;
 
 		for (i = 0; i < options.max_startups; i++) {
 			if (startup_pipes[i] == -1 ||
-			    !FD_ISSET(startup_pipes[i], fdset))
+			    startup_pollfd[i] == -1 ||
+			    !(pfd[startup_pollfd[i]].revents & (POLLIN|POLLHUP)))
 				continue;
 			switch (read(startup_pipes[i], &c, sizeof(c))) {
 			case -1:
@@ -1229,7 +1253,7 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 			}
 		}
 		for (i = 0; i < num_listen_socks; i++) {
-			if (!FD_ISSET(listen_socks[i], fdset))
+			if (!(pfd[i].revents & POLLIN))
 				continue;
 			fromlen = sizeof(from);
 			*newsock = accept(listen_socks[i],
@@ -1243,9 +1267,15 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 					usleep(100 * 1000);
 				continue;
 			}
-			if (unset_nonblock(*newsock) == -1 ||
-			    pipe(startup_p) == -1)
+			if (unset_nonblock(*newsock) == -1) {
+				close(*newsock);
 				continue;
+			}
+			if (pipe(startup_p) == -1) {
+				error_f("pipe(startup_p): %s", strerror(errno));
+				close(*newsock);
+				continue;
+			}
 			if (drop_connection(*newsock, startups, startup_p[0])) {
 				close(*newsock);
 				close(startup_p[0]);
@@ -1266,8 +1296,6 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 			for (j = 0; j < options.max_startups; j++)
 				if (startup_pipes[j] == -1) {
 					startup_pipes[j] = startup_p[0];
-					if (maxfd < startup_p[0])
-						maxfd = startup_p[0];
 					startups++;
 					startup_flags[j] = 1;
 					break;
@@ -1295,6 +1323,7 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 					send_rexec_state(config_s[0], cfg);
 					close(config_s[0]);
 				}
+				free(pfd);
 				return;
 			}
 
@@ -1337,6 +1366,7 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s)
 					(void)atomicio(vwrite, startup_pipe,
 					    "\0", 1);
 				}
+				free(pfd);
 				return;
 			}
 
@@ -1723,7 +1753,7 @@ main(int ac, char **av)
 		load_server_config(config_file_name, cfg);
 
 	parse_server_config(&options, rexeced_flag ? "rexec" : config_file_name,
-	    cfg, &includes, NULL);
+	    cfg, &includes, NULL, rexeced_flag);
 
 #ifdef WITH_OPENSSL
 	if (options.moduli_file != NULL)
@@ -1732,10 +1762,6 @@ main(int ac, char **av)
 
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
-
-	/* challenge-response is implemented via keyboard interactive */
-	if (options.challenge_response_authentication)
-		options.kbd_interactive_authentication = 1;
 
 	/* Check that options are sensible */
 	if (options.authorized_keys_command_user == NULL &&
@@ -1914,7 +1940,7 @@ main(int ac, char **av)
 		/* Find matching private key */
 		for (j = 0; j < options.num_host_key_files; j++) {
 			if (sshkey_equal_public(key,
-			    sensitive_data.host_keys[j])) {
+			    sensitive_data.host_pubkeys[j])) {
 				sensitive_data.host_certificates[j] = key;
 				break;
 			}
@@ -2067,15 +2093,8 @@ main(int ac, char **av)
 	 * setlogin() affects the entire process group.  We don't
 	 * want the child to be able to affect the parent.
 	 */
-#if !defined(SSHD_ACQUIRES_CTTY)
-	/*
-	 * If setsid is called, on some platforms sshd will later acquire a
-	 * controlling terminal which will result in "could not set
-	 * controlling tty" errors.
-	 */
 	if (!debug_flag && !inetd_flag && setsid() == -1)
 		error("setsid: %.100s", strerror(errno));
-#endif
 
 	if (rexec_flag) {
 		debug("rexec start in %d out %d newsock %d pipe %d sock %d",
@@ -2349,14 +2368,14 @@ do_ssh2_kex(struct ssh *ssh)
 {
 	char *myproposal[PROPOSAL_MAX] = { KEX_SERVER };
 	struct kex *kex;
+	char *prop_kex = NULL, *prop_enc = NULL, *prop_hostkey = NULL;
 	int r;
 
-	myproposal[PROPOSAL_KEX_ALGS] = compat_kex_proposal(ssh,
+	myproposal[PROPOSAL_KEX_ALGS] = prop_kex = compat_kex_proposal(ssh,
 	    options.kex_algorithms);
-	myproposal[PROPOSAL_ENC_ALGS_CTOS] = compat_cipher_proposal(ssh,
-	    options.ciphers);
-	myproposal[PROPOSAL_ENC_ALGS_STOC] = compat_cipher_proposal(ssh,
-	    options.ciphers);
+	myproposal[PROPOSAL_ENC_ALGS_CTOS] =
+	    myproposal[PROPOSAL_ENC_ALGS_STOC] = prop_enc =
+	    compat_cipher_proposal(ssh, options.ciphers);
 	myproposal[PROPOSAL_MAC_ALGS_CTOS] =
 	    myproposal[PROPOSAL_MAC_ALGS_STOC] = options.macs;
 
@@ -2369,8 +2388,8 @@ do_ssh2_kex(struct ssh *ssh)
 		ssh_packet_set_rekey_limits(ssh, options.rekey_limit,
 		    options.rekey_interval);
 
-	myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = compat_pkalg_proposal(
-	    ssh, list_hostkey_types());
+	myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = prop_hostkey =
+	   compat_pkalg_proposal(ssh, list_hostkey_types());
 
 	/* start key exchange */
 	if ((r = kex_setup(ssh, myproposal)) != 0)
@@ -2405,6 +2424,9 @@ do_ssh2_kex(struct ssh *ssh)
 	    (r = ssh_packet_write_wait(ssh)) != 0)
 		fatal_fr(r, "send test");
 #endif
+	free(prop_kex);
+	free(prop_enc);
+	free(prop_hostkey);
 	debug("KEX done");
 }
 

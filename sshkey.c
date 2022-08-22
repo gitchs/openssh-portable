@@ -1,4 +1,4 @@
-/* $OpenBSD: sshkey.c,v 1.116 2021/04/03 06:18:41 djm Exp $ */
+/* $OpenBSD: sshkey.c,v 1.121 2022/05/05 01:04:14 djm Exp $ */
 /*
  * Copyright (c) 2000, 2001 Markus Friedl.  All rights reserved.
  * Copyright (c) 2008 Alexander von Gernler.  All rights reserved.
@@ -107,10 +107,12 @@ static const struct keytype keytypes[] = {
 	{ "ssh-ed25519", "ED25519", NULL, KEY_ED25519, 0, 0, 0 },
 	{ "ssh-ed25519-cert-v01@openssh.com", "ED25519-CERT", NULL,
 	    KEY_ED25519_CERT, 0, 1, 0 },
+#ifdef ENABLE_SK
 	{ "sk-ssh-ed25519@openssh.com", "ED25519-SK", NULL,
 	    KEY_ED25519_SK, 0, 0, 0 },
 	{ "sk-ssh-ed25519-cert-v01@openssh.com", "ED25519-SK-CERT", NULL,
 	    KEY_ED25519_SK_CERT, 0, 1, 0 },
+#endif
 #ifdef WITH_XMSS
 	{ "ssh-xmss@openssh.com", "XMSS", NULL, KEY_XMSS, 0, 0, 0 },
 	{ "ssh-xmss-cert-v01@openssh.com", "XMSS-CERT", NULL,
@@ -130,10 +132,12 @@ static const struct keytype keytypes[] = {
 	{ "ecdsa-sha2-nistp521", "ECDSA", NULL,
 	    KEY_ECDSA, NID_secp521r1, 0, 0 },
 #  endif /* OPENSSL_HAS_NISTP521 */
+#  ifdef ENABLE_SK
 	{ "sk-ecdsa-sha2-nistp256@openssh.com", "ECDSA-SK", NULL,
 	    KEY_ECDSA_SK, NID_X9_62_prime256v1, 0, 0 },
 	{ "webauthn-sk-ecdsa-sha2-nistp256@openssh.com", "ECDSA-SK", NULL,
 	    KEY_ECDSA_SK, NID_X9_62_prime256v1, 0, 1 },
+#  endif /* ENABLE_SK */
 # endif /* OPENSSL_HAS_ECC */
 	{ "ssh-rsa-cert-v01@openssh.com", "RSA-CERT", NULL,
 	    KEY_RSA_CERT, 0, 1, 0 },
@@ -152,8 +156,10 @@ static const struct keytype keytypes[] = {
 	{ "ecdsa-sha2-nistp521-cert-v01@openssh.com", "ECDSA-CERT", NULL,
 	    KEY_ECDSA_CERT, NID_secp521r1, 1, 0 },
 #  endif /* OPENSSL_HAS_NISTP521 */
+#  ifdef ENABLE_SK
 	{ "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com", "ECDSA-SK-CERT", NULL,
 	    KEY_ECDSA_SK_CERT, NID_X9_62_prime256v1, 1, 0 },
+#  endif /* ENABLE_SK */
 # endif /* OPENSSL_HAS_ECC */
 #endif /* WITH_OPENSSL */
 	{ NULL, NULL, NULL, -1, -1, 0, 0 }
@@ -247,6 +253,29 @@ sshkey_ecdsa_nid_from_name(const char *name)
 			return kt->nid;
 	}
 	return -1;
+}
+
+int
+sshkey_match_keyname_to_sigalgs(const char *keyname, const char *sigalgs)
+{
+	int ktype;
+
+	if (sigalgs == NULL || *sigalgs == '\0' ||
+	    (ktype = sshkey_type_from_name(keyname)) == KEY_UNSPEC)
+		return 0;
+	else if (ktype == KEY_RSA) {
+		return match_pattern_list("ssh-rsa", sigalgs, 0) == 1 ||
+		    match_pattern_list("rsa-sha2-256", sigalgs, 0) == 1 ||
+		    match_pattern_list("rsa-sha2-512", sigalgs, 0) == 1;
+	} else if (ktype == KEY_RSA_CERT) {
+		return match_pattern_list("ssh-rsa-cert-v01@openssh.com",
+		    sigalgs, 0) == 1 ||
+		    match_pattern_list("rsa-sha2-256-cert-v01@openssh.com",
+		    sigalgs, 0) == 1 ||
+		    match_pattern_list("rsa-sha2-512-cert-v01@openssh.com",
+		    sigalgs, 0) == 1;
+	} else
+		return match_pattern_list(keyname, sigalgs, 0) == 1;
 }
 
 char *
@@ -2096,14 +2125,38 @@ sshkey_shield_private(struct sshkey *k)
 	return r;
 }
 
+/* Check deterministic padding after private key */
+static int
+private2_check_padding(struct sshbuf *decrypted)
+{
+	u_char pad;
+	size_t i;
+	int r;
+
+	i = 0;
+	while (sshbuf_len(decrypted)) {
+		if ((r = sshbuf_get_u8(decrypted, &pad)) != 0)
+			goto out;
+		if (pad != (++i & 0xff)) {
+			r = SSH_ERR_INVALID_FORMAT;
+			goto out;
+		}
+	}
+	/* success */
+	r = 0;
+ out:
+	explicit_bzero(&pad, sizeof(pad));
+	explicit_bzero(&i, sizeof(i));
+	return r;
+}
+
 int
 sshkey_unshield_private(struct sshkey *k)
 {
 	struct sshbuf *prvbuf = NULL;
-	u_char pad, *cp, keyiv[SSH_DIGEST_MAX_LENGTH];
+	u_char *cp, keyiv[SSH_DIGEST_MAX_LENGTH];
 	struct sshcipher_ctx *cctx = NULL;
 	const struct sshcipher *cipher;
-	size_t i;
 	struct sshkey *kswap = NULL, tmp;
 	int r = SSH_ERR_INTERNAL_ERROR;
 
@@ -2165,16 +2218,9 @@ sshkey_unshield_private(struct sshkey *k)
 	/* Parse private key */
 	if ((r = sshkey_private_deserialize(prvbuf, &kswap)) != 0)
 		goto out;
-	/* Check deterministic padding */
-	i = 0;
-	while (sshbuf_len(prvbuf)) {
-		if ((r = sshbuf_get_u8(prvbuf, &pad)) != 0)
-			goto out;
-		if (pad != (++i & 0xff)) {
-			r = SSH_ERR_INVALID_FORMAT;
-			goto out;
-		}
-	}
+
+	if ((r = private2_check_padding(prvbuf)) != 0)
+		goto out;
 
 	/* Swap the parsed key back into place */
 	tmp = *kswap;
@@ -3077,10 +3123,9 @@ sshkey_certify(struct sshkey *k, struct sshkey *ca, const char *alg,
 int
 sshkey_cert_check_authority(const struct sshkey *k,
     int want_host, int require_principal, int wildcard_pattern,
-    const char *name, const char **reason)
+    uint64_t verify_time, const char *name, const char **reason)
 {
 	u_int i, principal_matches;
-	time_t now = time(NULL);
 
 	if (reason == NULL)
 		return SSH_ERR_INVALID_ARGUMENT;
@@ -3099,16 +3144,11 @@ sshkey_cert_check_authority(const struct sshkey *k,
 			return SSH_ERR_KEY_CERT_INVALID;
 		}
 	}
-	if (now < 0) {
-		/* yikes - system clock before epoch! */
+	if (verify_time < k->cert->valid_after) {
 		*reason = "Certificate invalid: not yet valid";
 		return SSH_ERR_KEY_CERT_INVALID;
 	}
-	if ((u_int64_t)now < k->cert->valid_after) {
-		*reason = "Certificate invalid: not yet valid";
-		return SSH_ERR_KEY_CERT_INVALID;
-	}
-	if ((u_int64_t)now >= k->cert->valid_before) {
+	if (verify_time >= k->cert->valid_before) {
 		*reason = "Certificate invalid: expired";
 		return SSH_ERR_KEY_CERT_INVALID;
 	}
@@ -3141,13 +3181,29 @@ sshkey_cert_check_authority(const struct sshkey *k,
 }
 
 int
+sshkey_cert_check_authority_now(const struct sshkey *k,
+    int want_host, int require_principal, int wildcard_pattern,
+    const char *name, const char **reason)
+{
+	time_t now;
+
+	if ((now = time(NULL)) < 0) {
+		/* yikes - system clock before epoch! */
+		*reason = "Certificate invalid: not yet valid";
+		return SSH_ERR_KEY_CERT_INVALID;
+	}
+	return sshkey_cert_check_authority(k, want_host, require_principal,
+	    wildcard_pattern, (uint64_t)now, name, reason);
+}
+
+int
 sshkey_cert_check_host(const struct sshkey *key, const char *host,
     int wildcard_principals, const char *ca_sign_algorithms,
     const char **reason)
 {
 	int r;
 
-	if ((r = sshkey_cert_check_authority(key, 1, 0, wildcard_principals,
+	if ((r = sshkey_cert_check_authority_now(key, 1, 0, wildcard_principals,
 	    host, reason)) != 0)
 		return r;
 	if (sshbuf_len(key->cert->critical) != 0) {
@@ -3166,28 +3222,16 @@ size_t
 sshkey_format_cert_validity(const struct sshkey_cert *cert, char *s, size_t l)
 {
 	char from[32], to[32], ret[128];
-	time_t tt;
-	struct tm *tm;
 
 	*from = *to = '\0';
 	if (cert->valid_after == 0 &&
 	    cert->valid_before == 0xffffffffffffffffULL)
 		return strlcpy(s, "forever", l);
 
-	if (cert->valid_after != 0) {
-		/* XXX revisit INT_MAX in 2038 :) */
-		tt = cert->valid_after > INT_MAX ?
-		    INT_MAX : cert->valid_after;
-		tm = localtime(&tt);
-		strftime(from, sizeof(from), "%Y-%m-%dT%H:%M:%S", tm);
-	}
-	if (cert->valid_before != 0xffffffffffffffffULL) {
-		/* XXX revisit INT_MAX in 2038 :) */
-		tt = cert->valid_before > INT_MAX ?
-		    INT_MAX : cert->valid_before;
-		tm = localtime(&tt);
-		strftime(to, sizeof(to), "%Y-%m-%dT%H:%M:%S", tm);
-	}
+	if (cert->valid_after != 0)
+		format_absolute_time(cert->valid_after, from, sizeof(from));
+	if (cert->valid_before != 0xffffffffffffffffULL)
+		format_absolute_time(cert->valid_before, to, sizeof(to));
 
 	if (cert->valid_after == 0)
 		snprintf(ret, sizeof(ret), "before %s", to);
@@ -4001,9 +4045,9 @@ sshkey_private_to_blob2(struct sshkey *prv, struct sshbuf *blob,
 	explicit_bzero(salt, sizeof(salt));
 	if (key != NULL)
 		freezero(key, keylen + ivlen);
-	if (pubkeyblob != NULL) 
+	if (pubkeyblob != NULL)
 		freezero(pubkeyblob, pubkeylen);
-	if (b64 != NULL) 
+	if (b64 != NULL)
 		freezero(b64, strlen(b64));
 	return r;
 }
@@ -4227,31 +4271,6 @@ private2_decrypt(struct sshbuf *decoded, const char *passphrase,
 	}
 	sshbuf_free(kdf);
 	sshbuf_free(decrypted);
-	return r;
-}
-
-/* Check deterministic padding after private key */
-static int
-private2_check_padding(struct sshbuf *decrypted)
-{
-	u_char pad;
-	size_t i;
-	int r = SSH_ERR_INTERNAL_ERROR;
-
-	i = 0;
-	while (sshbuf_len(decrypted)) {
-		if ((r = sshbuf_get_u8(decrypted, &pad)) != 0)
-			goto out;
-		if (pad != (++i & 0xff)) {
-			r = SSH_ERR_INVALID_FORMAT;
-			goto out;
-		}
-	}
-	/* success */
-	r = 0;
- out:
-	explicit_bzero(&pad, sizeof(pad));
-	explicit_bzero(&i, sizeof(i));
 	return r;
 }
 

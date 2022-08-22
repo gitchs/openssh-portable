@@ -1,47 +1,9 @@
-#	$OpenBSD: test-exec.sh,v 1.79 2021/04/06 23:57:56 dtucker Exp $
+#	$OpenBSD: test-exec.sh,v 1.92 2022/07/25 07:12:45 dtucker Exp $
 #	Placed in the Public Domain.
 
 #SUDO=sudo
 
-# Unbreak GNU head(1)
-_POSIX2_VERSION=199209
-export _POSIX2_VERSION
-
-case `uname -s 2>/dev/null` in
-OSF1*)
-	BIN_SH=xpg4
-	export BIN_SH
-	;;
-CYGWIN*)
-	os=cygwin
-	;;
-esac
-
-# If configure tells us to use a different egrep, create a wrapper function
-# to call it.  This means we don't need to change all the tests that depend
-# on a good implementation.
-if test "x${EGREP}" != "x"; then
-	egrep ()
-{
-	 ${EGREP} "$@"
-}
-fi
-
-if [ -x /usr/ucb/whoami ]; then
-	USER=`/usr/ucb/whoami`
-elif whoami >/dev/null 2>&1; then
-	USER=`whoami`
-elif logname >/dev/null 2>&1; then
-	USER=`logname`
-else
-	USER=`id -un`
-fi
-if test -z "$LOGNAME"; then
-	LOGNAME="${USER}"
-	export LOGNAME
-fi
-
-if [ ! -x "$TEST_SSH_ELAPSED_TIMES" ]; then
+if [ ! -z "$TEST_SSH_ELAPSED_TIMES" ]; then
 	STARTTIME=`date '+%s'`
 fi
 
@@ -77,6 +39,46 @@ else
 fi
 unset SSH_AUTH_SOCK
 
+# Portable-specific settings.
+
+if [ -x /usr/ucb/whoami ]; then
+	USER=`/usr/ucb/whoami`
+elif whoami >/dev/null 2>&1; then
+	USER=`whoami`
+elif logname >/dev/null 2>&1; then
+	USER=`logname`
+else
+	USER=`id -un`
+fi
+if test -z "$LOGNAME"; then
+	LOGNAME="${USER}"
+	export LOGNAME
+fi
+
+# Unbreak GNU head(1)
+_POSIX2_VERSION=199209
+export _POSIX2_VERSION
+
+case `uname -s 2>/dev/null` in
+OSF1*)
+	BIN_SH=xpg4
+	export BIN_SH
+	;;
+CYGWIN*)
+	os=cygwin
+	;;
+esac
+
+# If configure tells us to use a different egrep, create a wrapper function
+# to call it.  This means we don't need to change all the tests that depend
+# on a good implementation.
+if test "x${EGREP}" != "x"; then
+	egrep ()
+{
+	 ${EGREP} "$@"
+}
+fi
+
 SRC=`dirname ${SCRIPT}`
 
 # defaults
@@ -100,6 +102,7 @@ CONCH=conch
 
 # Tools used by multiple tests
 NC=$OBJ/netcat
+OPENSSL_BIN="${OPENSSL_BIN:-openssl}"
 
 if [ "x$TEST_SSH_SSH" != "x" ]; then
 	SSH="${TEST_SSH_SSH}"
@@ -154,6 +157,9 @@ if [ "x$TEST_SSH_PKCS11_HELPER" != "x" ]; then
 fi
 if [ "x$TEST_SSH_SK_HELPER" != "x" ]; then
 	SSH_SK_HELPER="${TEST_SSH_SK_HELPER}"
+fi
+if [ "x$TEST_SSH_OPENSSL" != "x" ]; then
+	OPENSSL_BIN="${TEST_SSH_OPENSSL}"
 fi
 
 # Path to sshd must be absolute for rexec
@@ -244,16 +250,46 @@ if [ "x$TEST_REGRESS_LOGFILE" = "x" ]; then
 	TEST_REGRESS_LOGFILE=$OBJ/regress.log
 fi
 
+# If set, keep track of successful tests and skip them them if we've
+# previously completed that test.
+if [ "x$TEST_REGRESS_CACHE_DIR" != "x" ]; then
+	if [ ! -d "$TEST_REGRESS_CACHE_DIR" ]; then
+		mkdir -p "$TEST_REGRESS_CACHE_DIR"
+	fi
+	TEST="`basename $SCRIPT .sh`"
+	CACHE="${TEST_REGRESS_CACHE_DIR}/${TEST}.cache"
+	for i in ${SSH} ${SSHD} ${SSHAGENT} ${SSHADD} ${SSHKEYGEN} ${SCP} \
+	    ${SFTP} ${SFTPSERVER} ${SSHKEYSCAN}; do
+		case $i in
+		/*)	bin="$i" ;;
+		*)	bin="`which $i`" ;;
+		esac
+		if [ "$bin" -nt "$CACHE" ]; then
+			rm -f "$CACHE"
+		fi
+	done
+	if [ -f "$CACHE" ]; then
+		echo ok cached $CACHE
+		exit 0
+	fi
+fi
+
 # truncate logfiles
 >$TEST_SSH_LOGFILE
 >$TEST_SSHD_LOGFILE
 >$TEST_REGRESS_LOGFILE
 
 # Create wrapper ssh with logging.  We can't just specify "SSH=ssh -E..."
-# because sftp and scp don't handle spaces in arguments.
+# because sftp and scp don't handle spaces in arguments.  scp and sftp like
+# to use -q so we remove those to preserve our debug logging.  In the rare
+# instance where -q is desirable -qq is equivalent and is not removed.
 SSHLOGWRAP=$OBJ/ssh-log-wrapper.sh
-echo "#!/bin/sh" > $SSHLOGWRAP
-echo "exec ${SSH} -E${TEST_SSH_LOGFILE} "'"$@"' >>$SSHLOGWRAP
+cat >$SSHLOGWRAP <<EOD
+#!/bin/sh
+echo "Executing: ${SSH} \$@" >>${TEST_SSH_LOGFILE}
+for i in "\$@";do shift;case "\$i" in -q):;; *) set -- "\$@" "\$i";;esac;done
+exec ${SSH} -E${TEST_SSH_LOGFILE} "\$@"
+EOD
 
 chmod a+rx $OBJ/ssh-log-wrapper.sh
 REAL_SSH="$SSH"
@@ -284,7 +320,7 @@ export SSH_PKCS11_HELPER SSH_SK_HELPER
 #echo $SSH $SSHD $SSHAGENT $SSHADD $SSHKEYGEN $SSHKEYSCAN $SFTP $SFTPSERVER $SCP
 
 # Portable specific functions
-have_prog()
+which()
 {
 	saved_IFS="$IFS"
 	IFS=":"
@@ -292,16 +328,30 @@ have_prog()
 	do
 		if [ -x $i/$1 ]; then
 			IFS="$saved_IFS"
+			echo "$i/$1"
 			return 0
 		fi
 	done
 	IFS="$saved_IFS"
+	echo "$i/$1"
 	return 1
+}
+
+have_prog()
+{
+	which "$1" >/dev/null 2>&1
+	return $?
 }
 
 jot() {
 	awk "BEGIN { for (i = $2; i < $2 + $1; i++) { printf \"%d\n\", i } exit }"
 }
+if [ ! -x "`which rev`" ]; then
+rev()
+{
+	awk '{for (i=length; i>0; i--) printf "%s", substr($0, i, 1); print ""}'
+}
+fi
 
 # Check whether preprocessor symbols are defined in config.h.
 config_defined ()
@@ -323,6 +373,8 @@ md5 () {
 		cksum
 	elif have_prog sum; then
 		sum
+	elif [ -x ${OPENSSL_BIN} ]; then
+		${OPENSSL_BIN} md5
 	else
 		wc -c
 	fi
@@ -449,6 +501,14 @@ fatal ()
 	exit $RESULT
 }
 
+# Skip remaining tests in script.
+skip ()
+{
+	echo "SKIPPED: $@"
+	cleanup
+	exit $RESULT
+}
+
 RESULT=0
 PIDFILE=$OBJ/pidfile
 
@@ -528,7 +588,6 @@ Host *
 	UserKnownHostsFile	$OBJ/known_hosts
 	PubkeyAuthentication	yes
 	ChallengeResponseAuthentication	no
-	HostbasedAuthentication	no
 	PasswordAuthentication	no
 	BatchMode		yes
 	StrictHostKeyChecking	yes
@@ -547,6 +606,8 @@ if ! config_defined ENABLE_SK; then
 	trace skipping sk-dummy
 elif [ -f "${SRC}/misc/sk-dummy/obj/sk-dummy.so" ] ; then
 	SSH_SK_PROVIDER="${SRC}/misc/sk-dummy/obj/sk-dummy.so"
+elif [ -f "${OBJ}/misc/sk-dummy/sk-dummy.so" ] ; then
+	SSH_SK_PROVIDER="${OBJ}/misc/sk-dummy/sk-dummy.so"
 elif [ -f "${SRC}/misc/sk-dummy/sk-dummy.so" ] ; then
 	SSH_SK_PROVIDER="${SRC}/misc/sk-dummy/sk-dummy.so"
 fi
@@ -595,7 +656,7 @@ for t in ${SSH_HOSTKEY_TYPES}; do
 	) >> $OBJ/known_hosts
 
 	# use key as host key, too
-	$SUDO cp $OBJ/$t $OBJ/host.$t
+	(umask 077; $SUDO cp $OBJ/$t $OBJ/host.$t)
 	echo HostKey $OBJ/host.$t >> $OBJ/sshd_config
 
 	# don't use SUDO for proxy connect
@@ -691,6 +752,24 @@ start_sshd ()
 cleanup
 
 if [ "x$USE_VALGRIND" != "x" ]; then
+	# If there is an EXIT trap handler, invoke it now.
+	# Some tests set these to clean up processes such as ssh-agent.  We
+	# need to wait for all valgrind processes to complete so we can check
+	# their logs, but since the EXIT traps are not invoked until
+	# test-exec.sh exits, waiting here will deadlock.
+	# This is not very portable but then neither is valgrind itself.
+	# As a bonus, dash (as used on the runners) has a "trap" that doesn't
+	# work in a pipeline (hence the temp file) or a subshell.
+	exithandler=""
+	trap >/tmp/trap.$$ && exithandler=$(cat /tmp/trap.$$ | \
+	    awk -F "'" '/EXIT$/{print $2}')
+	rm -f /tmp/trap.$$
+	if [ "x${exithandler}" != "x" ]; then
+		verbose invoking EXIT trap handler early: ${exithandler}
+		eval "${exithandler}"
+		trap '' EXIT
+	fi
+
 	# wait for any running process to complete
 	wait; sleep 1
 	VG_RESULTS=$(find $OBJ/valgrind-out -type f -print)
@@ -716,6 +795,9 @@ fi
 
 if [ $RESULT -eq 0 ]; then
 	verbose ok $tid
+	if [ "x$CACHE" != "x" ]; then
+		touch "$CACHE"
+	fi
 else
 	echo failed $tid
 fi

@@ -33,16 +33,18 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifdef HAVE_SYS_RANDOM_H
-# include <sys/random.h>
-#endif
-
 #ifndef HAVE_ARC4RANDOM
 
-#ifdef WITH_OPENSSL
-#include <openssl/rand.h>
-#include <openssl/err.h>
+/*
+ * If we're not using a native getentropy, use the one from bsd-getentropy.c
+ * under a different name, so that if in future these binaries are run on
+ * a system that has a native getentropy OpenSSL cannot call the wrong one.
+ */
+#ifndef HAVE_GETENTROPY
+# define getentropy(x, y) (_ssh_compat_getentropy((x), (y)))
 #endif
+
+#define MINIMUM(a, b)    (((a) < (b)) ? (a) : (b))
 
 #include "log.h"
 
@@ -77,54 +79,17 @@ _rs_init(u_char *buf, size_t n)
 {
 	if (n < KEYSZ + IVSZ)
 		return;
-	chacha_keysetup(&rs, buf, KEYSZ * 8, 0);
+	chacha_keysetup(&rs, buf, KEYSZ * 8);
 	chacha_ivsetup(&rs, buf + KEYSZ);
 }
-
-#ifndef WITH_OPENSSL
-# ifndef SSH_RANDOM_DEV
-#  define SSH_RANDOM_DEV "/dev/urandom"
-# endif /* SSH_RANDOM_DEV */
-static void
-getrnd(u_char *s, size_t len)
-{
-	int fd;
-	ssize_t r;
-	size_t o = 0;
-
-#ifdef HAVE_GETRANDOM
-	if ((r = getrandom(s, len, 0)) > 0 && (size_t)r == len)
-		return;
-#endif /* HAVE_GETRANDOM */
-
-	if ((fd = open(SSH_RANDOM_DEV, O_RDONLY)) == -1)
-		fatal("Couldn't open %s: %s", SSH_RANDOM_DEV, strerror(errno));
-	while (o < len) {
-		r = read(fd, s + o, len - o);
-		if (r < 0) {
-			if (errno == EAGAIN || errno == EINTR ||
-			    errno == EWOULDBLOCK)
-				continue;
-			fatal("read %s: %s", SSH_RANDOM_DEV, strerror(errno));
-		}
-		o += r;
-	}
-	close(fd);
-}
-#endif /* WITH_OPENSSL */
 
 static void
 _rs_stir(void)
 {
 	u_char rnd[KEYSZ + IVSZ];
 
-#ifdef WITH_OPENSSL
-	if (RAND_bytes(rnd, sizeof(rnd)) <= 0)
-		fatal("Couldn't obtain random bytes (error 0x%lx)",
-		    (unsigned long)ERR_get_error());
-#else
-	getrnd(rnd, sizeof(rnd));
-#endif
+	if (getentropy(rnd, sizeof rnd) == -1)
+		fatal("getentropy failed");
 
 	if (!rs_initialized) {
 		rs_initialized = 1;
@@ -164,7 +129,7 @@ _rs_rekey(u_char *dat, size_t datlen)
 	if (dat) {
 		size_t i, m;
 
-		m = MIN(datlen, KEYSZ + IVSZ);
+		m = MINIMUM(datlen, KEYSZ + IVSZ);
 		for (i = 0; i < m; i++)
 			rs_buf[i] ^= dat[i];
 	}
@@ -183,7 +148,7 @@ _rs_random_buf(void *_buf, size_t n)
 	_rs_stir_if_needed(n);
 	while (n > 0) {
 		if (rs_have > 0) {
-			m = MIN(n, rs_have);
+			m = MINIMUM(n, rs_have);
 			memcpy(buf, rs_buf + RSBUFSZ - rs_have, m);
 			memset(rs_buf + RSBUFSZ - rs_have, 0, m);
 			buf += m;
@@ -224,7 +189,7 @@ arc4random_addrandom(u_char *dat, int datlen)
 	if (!rs_initialized)
 		_rs_stir();
 	while (datlen > 0) {
-		m = MIN(datlen, KEYSZ + IVSZ);
+		m = MINIMUM(datlen, KEYSZ + IVSZ);
 		_rs_rekey(dat, m);
 		dat += m;
 		datlen -= m;
